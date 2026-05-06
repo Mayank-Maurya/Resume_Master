@@ -17,10 +17,32 @@ class CompileError(Exception):
         self.log = log
 
 
+_TEX_FALLBACK_DIRS = (
+    "/Library/TeX/texbin",
+    "/usr/local/texlive/2026basic/bin/universal-darwin",
+    "/Library/TeX/local/bin",
+)
+
+
+def _which_compiler(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in _TEX_FALLBACK_DIRS:
+        cand = Path(d) / name
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def _find_compiler() -> str | None:
-    for binary in ("tectonic", "pdflatex", "xelatex"):
-        if shutil.which(binary):
-            return binary
+    preferred = os.environ.get("LATEX_COMPILER")
+    if preferred:
+        if path := _which_compiler(preferred):
+            return path
+    for binary in ("xelatex", "pdflatex", "tectonic"):
+        if path := _which_compiler(binary):
+            return path
     return None
 
 
@@ -49,8 +71,9 @@ def compile_tex(tex_source: str) -> bytes:
         compiler, len(tex_source), OUTPUT_DIR, DEFAULT_TIMEOUT_SECS,
     )
 
-    if compiler == "tectonic":
-        cmd = ["tectonic", "--keep-logs", "-o", str(OUTPUT_DIR), str(tex_file)]
+    compiler_name = Path(compiler).name
+    if compiler_name == "tectonic":
+        cmd = [compiler, "--keep-logs", "-o", str(OUTPUT_DIR), str(tex_file)]
     else:
         cmd = [
             compiler,

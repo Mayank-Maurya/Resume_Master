@@ -18,20 +18,58 @@ SYSTEM_PROMPT = """You are an ATS resume content editor.
 
 You will receive:
 - A job description.
-- A JSON object whose keys are bullet IDs and values are the original bullet text from a candidate's resume.
+- A JSON object whose keys are bullet IDs and values are the original bullet text (PLAIN ENGLISH PROSE, no markup).
 
 Rewrite each bullet to maximize keyword overlap with the job description, while staying strictly truthful to the original. Output the rewritten bullets as a JSON object with the SAME keys.
 
 Hard rules:
+- PLAIN TEXT ONLY. No LaTeX commands (no \\textbf, \\texttt, \\item, \\section, \\href, no backslashes). No Markdown (no **bold**, no `code`). No HTML.
 - TRUTHFUL: never invent metrics, technologies, employers, projects, dates, or accomplishments. If the original says "20% latency improvement", do not change the number. If the original lists Node.js, do not invent Python.
-- PRESERVE inline LaTeX commands inside the bullet (e.g., \\textbf{...}, \\href{...}{...}, \\emph{...}). Keep matched braces.
 - Keep each rewritten bullet within ~20% of the original length.
 - Use the JD's vocabulary where the candidate genuinely has the skill.
 - Lead each bullet with a strong action verb.
 
 Output format:
-A single JSON object. No prose, no markdown fences, no commentary. Example:
+A single JSON object whose values are PLAIN STRINGS. No prose, no markdown fences, no commentary. Example:
 {"0": "rewritten bullet 0", "1": "rewritten bullet 1", ...}"""
+
+
+_FORMAT_CMDS = (
+    "textbf", "textit", "texttt", "emph", "underline",
+    "textsc", "textsl", "textsf", "textrm", "textmd", "textup",
+)
+_STRIP_RE = re.compile(r"\\(?:" + "|".join(_FORMAT_CMDS) + r")\*?\{([^{}]*)\}")
+_TWO_ARG_RE = re.compile(r"\\(?:href|textcolor|colorbox)\{[^{}]*\}\{([^{}]*)\}")
+_LATEX_UNESCAPE = (
+    ("\\&", "&"), ("\\%", "%"), ("\\$", "$"),
+    ("\\#", "#"), ("\\_", "_"),
+    ("~", " "),
+)
+_LATEX_ESCAPE = (
+    ("&", "\\&"), ("%", "\\%"), ("$", "\\$"),
+    ("#", "\\#"), ("_", "\\_"),
+)
+
+
+def strip_inline_latex(text: str) -> str:
+    """Convert a LaTeX-flavored bullet to plain prose for the LLM."""
+    out = text
+    for _ in range(8):
+        new = _STRIP_RE.sub(r"\1", out)
+        new = _TWO_ARG_RE.sub(r"\1", new)
+        if new == out:
+            break
+        out = new
+    for esc, plain in _LATEX_UNESCAPE:
+        out = out.replace(esc, plain)
+    return " ".join(out.split())
+
+
+def escape_for_latex(text: str) -> str:
+    """Re-apply LaTeX escapes so plain LLM output substitutes safely back into .tex."""
+    for find, sub in _LATEX_ESCAPE:
+        text = text.replace(find, sub)
+    return text
 
 
 @dataclass
@@ -106,8 +144,29 @@ def tailor_resume(
         )
     logger.info("Found %d bullets to tailor", len(spans))
 
-    bullets = [s.text for s in spans]
-    tailored = _tailor_bullets_via_llm(bullets, job_description)
+    bullets_plain = [strip_inline_latex(s.text) for s in spans]
+    for i, (s, plain) in enumerate(zip(spans, bullets_plain)):
+        logger.info(
+            "Extracted bullet [%d] (pos %d-%d):\n    RAW:    %s\n    PLAIN:  %s",
+            i, s.start, s.end, s.text, plain,
+        )
+
+    tailored_plain = _tailor_bullets_via_llm(bullets_plain, job_description)
+
+    tailored_escaped: list[str] = []
+    for i in range(len(bullets_plain)):
+        if i < len(tailored_plain) and tailored_plain[i] and tailored_plain[i] != bullets_plain[i]:
+            escaped = escape_for_latex(tailored_plain[i])
+            tailored_escaped.append(escaped)
+            logger.info(
+                "Tailored bullet [%d]:\n    BEFORE: %s\n    AFTER:  %s",
+                i, bullets_plain[i], tailored_plain[i],
+            )
+        else:
+            tailored_escaped.append(spans[i].text)
+            logger.info("Bullet [%d]: kept original (LLM returned blank/unchanged)", i)
+
+    tailored = tailored_escaped
 
     if len(tailored) != len(bullets):
         logger.warning(
@@ -138,9 +197,10 @@ def _tailor_bullets_via_llm(bullets: list[str], jd: str) -> list[str]:
     model = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
 
     payload = {str(i): b for i, b in enumerate(bullets)}
+    payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
     user_msg = (
         f"<job_description>\n{jd}\n</job_description>\n\n"
-        f"<original_bullets>\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</original_bullets>\n\n"
+        f"<original_bullets>\n{payload_json}\n</original_bullets>\n\n"
         "Rewrite each bullet per the rules. Output JSON with the same keys."
     )
 
@@ -148,6 +208,7 @@ def _tailor_bullets_via_llm(bullets: list[str], jd: str) -> list[str]:
         "Calling model=%s for %d bullets (jd=%d chars, prompt~=%d chars)",
         model, len(bullets), len(jd), len(user_msg),
     )
+    logger.debug("Full JSON payload to LLM:\n%s", payload_json)
 
     start = time.perf_counter()
     response = client.chat.completions.create(
@@ -163,6 +224,7 @@ def _tailor_bullets_via_llm(bullets: list[str], jd: str) -> list[str]:
 
     text = (response.choices[0].message.content or "").strip()
     usage = getattr(response, "usage", None)
+    print(f"{text}")
     if usage is not None:
         logger.info(
             "Model responded in %.2fs: %d chars (prompt=%s, completion=%s, total=%s tokens)",

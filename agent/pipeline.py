@@ -6,47 +6,53 @@ from .tailor import tailor_resume
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-
 
 def run(resume_tex: str, job_description: str) -> Iterator[dict]:
-    """Stream pipeline events. Final event is either 'done' or 'error'."""
-    logger.info(
-        "Pipeline start: resume=%d chars, jd=%d chars, max_retries=%d",
-        len(resume_tex), len(job_description), MAX_RETRIES,
-    )
-    previous_attempt: str | None = None
-    compile_error: str | None = None
+    """Stream pipeline events.
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        logger.info("Attempt %d/%d: tailoring", attempt, MAX_RETRIES)
-        yield {"stage": "tailoring", "attempt": attempt}
-        edited_tex = tailor_resume(
+    New design: LLM only rewrites bullet text; LaTeX structure is never touched.
+    Compile failures become rare (only if the original .tex had issues), so no retry.
+    """
+    logger.info(
+        "Pipeline start: resume=%d chars, jd=%d chars",
+        len(resume_tex), len(job_description),
+    )
+
+    yield {"stage": "tailoring", "attempt": 1}
+    try:
+        new_tex = tailor_resume(
             resume_tex=resume_tex,
             job_description=job_description,
-            previous_attempt=previous_attempt,
-            compile_error=compile_error,
         )
+    except Exception as e:
+        logger.exception("Tailoring failed")
+        yield {
+            "stage": "error",
+            "message": f"Tailoring failed: {e}",
+            "last_log": str(e),
+            "last_tex": None,
+        }
+        return
 
-        logger.info("Attempt %d/%d: compiling (%d chars)", attempt, MAX_RETRIES, len(edited_tex))
-        yield {"stage": "compiling", "attempt": attempt}
-        try:
-            pdf_bytes = compile_tex(edited_tex)
-            logger.info(
-                "Pipeline done on attempt %d: %d-byte PDF", attempt, len(pdf_bytes)
-            )
-            yield {"stage": "done", "tex": edited_tex, "pdf": pdf_bytes}
-            return
-        except CompileError as e:
-            previous_attempt = edited_tex
-            compile_error = e.log
-            logger.warning("Attempt %d failed; will retry with compile log fed back", attempt)
-            yield {"stage": "compile_failed", "attempt": attempt, "log": e.log}
+    yield {"stage": "compiling", "attempt": 1}
+    try:
+        pdf_bytes = compile_tex(new_tex)
+    except CompileError as e:
+        logger.error(
+            "Compile failed. Since structure was preserved, the original .tex likely "
+            "had pre-existing issues OR a bullet replacement contained malformed LaTeX."
+        )
+        yield {
+            "stage": "error",
+            "message": (
+                "Compile failed. Bullet substitutions preserve the LaTeX structure, "
+                "so this usually means the original resume.tex had compile issues, "
+                "or a tailored bullet contained malformed LaTeX. See the log."
+            ),
+            "last_log": e.log,
+            "last_tex": new_tex,
+        }
+        return
 
-    logger.error("Pipeline failed after %d attempts", MAX_RETRIES)
-    yield {
-        "stage": "error",
-        "message": f"Failed to produce a compilable PDF after {MAX_RETRIES} attempts.",
-        "last_log": compile_error,
-        "last_tex": previous_attempt,
-    }
+    logger.info("Pipeline done: %d-byte PDF", len(pdf_bytes))
+    yield {"stage": "done", "tex": new_tex, "pdf": pdf_bytes}
