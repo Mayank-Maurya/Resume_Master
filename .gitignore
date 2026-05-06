@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.aux
+*.log
+*.out
+*.synctex.gz
+.DS_Store
+output/
+resume_maker
